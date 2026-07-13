@@ -1,0 +1,12 @@
+diff --git a/make-linux.mk b/make-linux.mk
+--- a/make-linux.mk
++++ b/make-linux.mk
+@@ -366,7 +366,7 @@ endif
+ #override CXXFLAGS+=-fPIC -fPIE
+ 
+ # Non-executable stack
+-override LDFLAGS+=-Wl,-z,noexecstack
++#override LDFLAGS+=-Wl,-z,noexecstack
+ 
+ .PHONY: all
+ all:	one

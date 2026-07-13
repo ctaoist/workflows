@@ -1,0 +1,23 @@
+diff --git a/make-linux.mk b/make-linux.mk
+--- a/make-linux.mk
++++ b/make-linux.mk
+@@ -359,7 +359,7 @@ ifeq ($(ZT_CONTROLLER),1)
+ endif
+ 
+ # ARM32 hell -- use conservative CFLAGS
+-ifeq ($(ZT_ARCHITECTURE),3)
++ifeq (0,3)
+ 	ifeq ($(shell if [ -e /usr/bin/dpkg ]; then dpkg --print-architecture; fi),armel)
+ 		override CFLAGS+=-march=armv5t -mfloat-abi=soft -msoft-float -mno-unaligned-access -marm
+ 		override CXXFLAGS+=-march=armv5t -mfloat-abi=soft -msoft-float -mno-unaligned-access -marm
+@@ -390,8 +390,8 @@ ifeq ($(ZT_USE_ARM32_NEON_ASM_CRYPTO),1)
+ endif
+ 
+ # Position Independence
+-override CFLAGS+=-fPIC -fPIE
+-override CXXFLAGS+=-fPIC -fPIE
++#override CFLAGS+=-fPIC -fPIE
++#override CXXFLAGS+=-fPIC -fPIE
+ 
+ # Non-executable stack
+ override LDFLAGS+=-Wl,-z,noexecstack

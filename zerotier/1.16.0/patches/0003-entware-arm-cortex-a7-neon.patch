@@ -1,0 +1,12 @@
+diff --git a/node/Constants.hpp b/node/Constants.hpp
+--- a/node/Constants.hpp
++++ b/node/Constants.hpp
+@@ -118,7 +118,7 @@
+ #include <xmmintrin.h>
+ #endif
+ 
+-#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(ZT_ARCH_ARM_HAS_NEON))
++#if (defined(__aarch64__) || defined(ZT_ARCH_ARM_HAS_NEON))
+ #if (defined(__APPLE__) && ! defined(__LP64__)) || (defined(__ANDROID__) && defined(__arm__))
+ #ifdef ZT_ARCH_ARM_HAS_NEON
+ #undef ZT_ARCH_ARM_HAS_NEON

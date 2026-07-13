@@ -1,0 +1,185 @@
+name: Build ZeroTier (armv7 soft-float)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zerotier_ref:
+        description: 'ZeroTierOne git tag or branch to build'
+        required: true
+        default: '1.16.0'
+        type: string
+      release_tag:
+        description: 'GitHub Release tag to create or update, e.g. zerotier-1.16.0-armv7l-softfloat'
+        required: true
+        type: string
+      asset_name:
+        description: 'Release archive name; .tar.gz is appended when omitted (existing asset is replaced)'
+        required: true
+        default: 'zerotier-one-armv7l-softfloat'
+        type: string
+      apply_patches:
+        description: 'Apply Entware/source patches before building'
+        required: true
+        default: true
+        type: boolean
+
+# Required for creating a missing Release and replacing its asset.
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build and publish armv7 soft-float binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZEROTIER_REF: ${{ inputs.zerotier_ref }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ASSET_NAME: ${{ inputs.asset_name }}
+      APPLY_PATCHES: ${{ inputs.apply_patches }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out workflow patches
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ZEROTIER_REF"
+          test -n "$RELEASE_TAG"
+          test -n "$ASSET_NAME"
+          if ! git check-ref-format --allow-onelevel "refs/tags/$RELEASE_TAG"; then
+            cat >&2 <<'EOF'
+          release_tag must be a valid Git tag, for example:
+            zerotier-1.16.0-armv7l-softfloat
+          Do not include spaces, `refs/tags/`, colons, question marks, asterisks, brackets, backslashes, carets, or tildes.
+          A tag must not end in a dot.
+          EOF
+            exit 1
+          fi
+          case "$ASSET_NAME" in
+            */* | . | ..) echo 'asset_name must be a file name, not a path' >&2; exit 1 ;;
+          esac
+          case "$ASSET_NAME" in
+            *.tar.gz) archive_name="$ASSET_NAME" ;;
+            *) archive_name="$ASSET_NAME.tar.gz" ;;
+          esac
+          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+          if [[ "$APPLY_PATCHES" == 'true' ]]; then
+            case "$ZEROTIER_REF" in
+              */* | *..*) echo 'zerotier_ref must be a simple version name when applying patches' >&2; exit 1 ;;
+            esac
+          fi
+
+      - name: Install ARM soft-float cross compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates git file binutils-arm-linux-gnueabi \
+            gcc-arm-linux-gnueabi g++-arm-linux-gnueabi libc6-dev-armel-cross
+
+      - name: Clone and build ZeroTier statically
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/ZeroTierOne"
+          output_dir="$RUNNER_TEMP/output"
+          package_dir="$RUNNER_TEMP/package"
+          toolchain_dir="$RUNNER_TEMP/softfloat-toolchain"
+          rm -rf "$source_dir" "$output_dir" "$package_dir"
+          git clone --depth 1 --branch "$ZEROTIER_REF" \
+            https://github.com/zerotier/ZeroTierOne.git "$source_dir"
+
+          cd "$source_dir"
+          if [[ "$APPLY_PATCHES" == 'true' ]]; then
+            patch_directory="zerotier/$ZEROTIER_REF/patches"
+            patch_dir="$GITHUB_WORKSPACE/$patch_directory"
+            test -d "$patch_dir" || {
+              echo "Patch directory not found: $patch_directory" >&2
+              exit 1
+            }
+            patch_count=0
+            while IFS= read -r -d '' patch; do
+              echo "Applying ${patch#$GITHUB_WORKSPACE/}"
+              git apply --whitespace=nowarn "$patch"
+              patch_count=$((patch_count + 1))
+            done < <(find "$patch_dir" -type f -name '*.patch' -print0 | sort -z)
+            (( patch_count > 0 )) || {
+              echo "No .patch files found in: $patch_directory" >&2
+              exit 1
+            }
+          fi
+
+          # Append ARMv7 soft-float flags after all upstream compiler options.
+          mkdir -p "$toolchain_dir"
+          for compiler in gcc g++; do
+            cat >"$toolchain_dir/arm-linux-gnueabi-$compiler" <<EOF
+          #!/usr/bin/env bash
+          exec /usr/bin/arm-linux-gnueabi-$compiler "\$@" -march=armv7-a -mfloat-abi=soft
+          EOF
+            chmod +x "$toolchain_dir/arm-linux-gnueabi-$compiler"
+          done
+
+          # arm-linux-gnueabi is the ARM EABI soft-float toolchain.  Disable
+          # ZeroTier's optional NEON assembler so the binary also runs on
+          # ARMv7 CPUs that do not implement NEON.
+          make -j"$(nproc)" \
+            CC="$toolchain_dir/arm-linux-gnueabi-gcc" \
+            CXX="$toolchain_dir/arm-linux-gnueabi-g++" \
+            CFLAGS='-O3' \
+            CXXFLAGS='-O3' \
+            LDFLAGS='-static' \
+            LDLIBS='-latomic' \
+            ZT_STATIC=1 \
+            ZT_EMBEDDED=1 \
+            ZT_SSO_SUPPORTED=0 \
+            ZT_NONFREE=0 \
+            DEFS='' \
+            OSTYPE=Linux \
+            ZT_USE_ARM32_NEON_ASM_CRYPTO=0
+
+          test -x zerotier-one
+          mkdir -p "$output_dir"
+          arm-linux-gnueabi-strip --strip-unneeded zerotier-one
+          mkdir -p "$package_dir/opt/bin"
+          install -m 0755 zerotier-one "$package_dir/opt/bin/zerotier-one"
+          ln -s zerotier-one "$package_dir/opt/bin/zerotier-cli"
+          ln -s zerotier-one "$package_dir/opt/bin/zerotier-idtool"
+          tar -C "$package_dir" -czf "$output_dir/$ARCHIVE_NAME" opt
+
+      - name: Verify target and static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/package/opt/bin/zerotier-one"
+          file "$binary"
+          file "$binary" | grep -q 'ARM'
+          file "$binary" | grep -q 'statically linked'
+          readelf -A "$binary" | grep -q 'Tag_CPU_arch: v7'
+          if readelf -A "$binary" | grep -q 'Tag_ABI_VFP_args: VFP registers'; then
+            echo 'The binary uses the hard-float ABI, expected soft-float.' >&2
+            exit 1
+          fi
+
+      - name: Create the Release when it does not exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes "ZeroTier $ZEROTIER_REF: armv7, soft-float, statically linked."
+          fi
+
+      - name: Replace the Release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/output/$ARCHIVE_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
