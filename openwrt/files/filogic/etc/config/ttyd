@@ -1,0 +1,8 @@
+
+config ttyd
+	option interface '@lan'
+	option command '/bin/login -f root'
+	option port '2222'
+	list client_option 'theme={"foreground": "black", "background": "white", "selectionBackground": "#bbd6fc"}'
+	option debug '7'
+

@@ -1,0 +1,467 @@
+name: Build OpenWrt base images
+
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild_toolchain:
+        description: Rebuild and replace the platform toolchain images
+        required: true
+        default: false
+        type: boolean
+      build_all_kmods:
+        description: Compile all OpenWrt kmod packages supported by the platform
+        required: true
+        default: false
+        type: boolean
+      build_sdk_imagebuilder:
+        description: Generate and publish the SDK and standalone ImageBuilder
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-base-images
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-24.10
+  REPO_BRANCH: openwrt-24.10-6.6
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64
+          - filogic
+
+    steps:
+      - name: Check out build resources
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -hT
+
+      - name: Resolve source revision
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git ls-remote "$REPO_URL" "refs/heads/$REPO_BRANCH" | awk 'NR == 1 { print $1 }')"
+          if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unable to resolve $REPO_URL branch $REPO_BRANCH." >&2
+            exit 1
+          fi
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "Resolved source commit: $source_commit"
+
+      - name: Create temporary Dockerfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/Dockerfile.openwrt-toolchain" <<'TOOLCHAIN_DOCKERFILE'
+          FROM ubuntu:22.04
+
+          ARG DEBIAN_FRONTEND=noninteractive
+          ARG TARGET_PLATFORM
+          ARG REPO_URL
+          ARG REPO_BRANCH
+          ARG TOOLCHAIN_COMMIT
+
+          ENV TZ=Asia/Shanghai
+          ENV FORCE_UNSAFE_CONFIGURE=1
+          ENV OPENWRT_REPO_URL=${REPO_URL}
+          ENV OPENWRT_REPO_BRANCH=${REPO_BRANCH}
+          ENV OPENWRT_TARGET_PLATFORM=${TARGET_PLATFORM}
+          ENV OPENWRT_TOOLCHAIN_COMMIT=${TOOLCHAIN_COMMIT}
+          ENV OPENWRT_TOOLCHAIN_SCHEMA=2
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+              build-essential bzip2 ca-certificates ccache cmake cpio curl \
+              device-tree-compiler fastjar flex gawk gettext gcc-multilib \
+              g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+              libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+              libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev \
+              libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs \
+              msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 \
+              python3 python3-pyelftools python3-setuptools qemu-utils rsync \
+              scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl \
+              unzip vim wget xmlto xxd zlib1g-dev && \
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+
+          WORKDIR /workdir
+          RUN git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt && \
+              cd openwrt && \
+              git fetch --depth 1 origin "$TOOLCHAIN_COMMIT" && \
+              git checkout -B "$REPO_BRANCH" "$TOOLCHAIN_COMMIT"
+
+          COPY openwrt/init_x86_64.config openwrt/init_filogic.config /tmp/configs/
+
+          RUN set -eux; \
+              cd /workdir/openwrt; \
+              init_config="/tmp/configs/init_${TARGET_PLATFORM}.config"; \
+              if [ ! -f "$init_config" ]; then \
+                echo "Initial configuration does not exist: $init_config" >&2; \
+                exit 1; \
+              fi; \
+              cp "$init_config" .config; \
+              if [ "$TARGET_PLATFORM" = x86_64 ]; then \
+                grep -qx 'CONFIG_MITIGATION_TSA=y' target/linux/x86/config-6.6 || \
+                  printf '%s\n' 'CONFIG_MITIGATION_TSA=y' >> target/linux/x86/config-6.6; \
+              fi; \
+              make defconfig; \
+              case "$TARGET_PLATFORM" in \
+                x86_64) \
+                  grep -qx 'CONFIG_TARGET_x86_64=y' .config; \
+                  grep -qx 'CONFIG_MITIGATION_TSA=y' target/linux/x86/config-6.6 \
+                  ;; \
+                filogic) \
+                  grep -qx 'CONFIG_TARGET_mediatek_filogic=y' .config; \
+                  grep -qx 'CONFIG_PACKAGE_kmod-mediatek_hnat=y' .config \
+                  ;; \
+              esac; \
+              make download -j8; \
+              find dl -type f -size -1024c -print -delete
+
+          RUN cd /workdir/openwrt && \
+              (make tools/compile -j"$(nproc)" || make tools/compile -j1 V=s)
+
+          RUN cd /workdir/openwrt && \
+              (make toolchain/compile -j"$(nproc)" || make toolchain/compile -j1 V=s) && \
+              rm -rf bin/targets
+
+          WORKDIR /workdir/openwrt
+          CMD ["/bin/bash"]
+          TOOLCHAIN_DOCKERFILE
+
+          cat > "$RUNNER_TEMP/Dockerfile.openwrt-base" <<'BASE_DOCKERFILE'
+          ARG TOOLCHAIN_IMAGE=ubuntu:22.04
+          FROM ${TOOLCHAIN_IMAGE} AS base
+
+          ARG TARGET_PLATFORM
+          ARG REPO_BRANCH
+          ARG SOURCE_COMMIT
+
+          ENV OPENWRT_SOURCE_COMMIT=${SOURCE_COMMIT}
+          ENV OPENWRT_BASE_SCHEMA=5
+          ENV OPENWRT_ALL_KMODS=false
+
+          COPY openwrt/init_x86_64.config openwrt/init_filogic.config openwrt/vermagic openwrt/vermagic_patch /tmp/custom/
+
+          RUN set -eux; \
+              cd /workdir/openwrt; \
+              git reset --hard; \
+              git clean -fd; \
+              git fetch --depth 1 origin "$SOURCE_COMMIT"; \
+              git checkout -B "$REPO_BRANCH" "$SOURCE_COMMIT"; \
+              rm -f .vermagic vermagic_patch; \
+              ./scripts/feeds update -a; \
+              ./scripts/feeds install -a; \
+              cp /tmp/custom/vermagic .vermagic; \
+              cp /tmp/custom/vermagic_patch ./vermagic_patch; \
+              git apply vermagic_patch; \
+              init_config="/tmp/custom/init_${TARGET_PLATFORM}.config"; \
+              if [ ! -f "$init_config" ]; then \
+                echo "Initial configuration does not exist: $init_config" >&2; \
+                exit 1; \
+              fi; \
+              cp "$init_config" .config; \
+              if [ "$TARGET_PLATFORM" = x86_64 ]; then \
+                grep -qx 'CONFIG_MITIGATION_TSA=y' target/linux/x86/config-6.6 || \
+                  printf '%s\n' 'CONFIG_MITIGATION_TSA=y' >> target/linux/x86/config-6.6; \
+              fi; \
+              make defconfig; \
+              case "$TARGET_PLATFORM" in \
+                x86_64) \
+                  grep -qx 'CONFIG_TARGET_x86_64=y' .config; \
+                  grep -qx 'CONFIG_MITIGATION_TSA=y' target/linux/x86/config-6.6 \
+                  ;; \
+                filogic) \
+                  grep -qx 'CONFIG_TARGET_mediatek_filogic=y' .config; \
+                  grep -qx 'CONFIG_PACKAGE_kmod-mediatek_hnat=y' .config \
+                  ;; \
+              esac; \
+              make download -j8; \
+              find dl -type f -size -1024c -print -delete
+
+          RUN cd /workdir/openwrt && \
+              (make target/compile -j"$(nproc)" || make target/compile -j1 V=s)
+
+          RUN cd /workdir/openwrt && \
+              (make package/compile -j"$(nproc)" || make package/compile -j1 V=s)
+
+          FROM base AS final
+
+          WORKDIR /workdir/openwrt
+          CMD ["/bin/bash"]
+
+          FROM base AS artifacts
+
+          ARG BUILD_ALL_KMODS=false
+          ARG BUILD_SDK_IMAGEBUILDER=false
+
+          RUN set -eux; \
+              cd /workdir/openwrt; \
+              if [ "$BUILD_ALL_KMODS" != true ] && [ "$BUILD_SDK_IMAGEBUILDER" != true ]; then \
+                echo 'No optional build output was selected.' >&2; \
+                exit 1; \
+              fi; \
+              if [ "$BUILD_ALL_KMODS" = true ]; then \
+                echo 'CONFIG_ALL_KMODS=y' >> .config; \
+              fi; \
+              if [ "$BUILD_SDK_IMAGEBUILDER" = true ]; then \
+                printf '%s\n' \
+                  'CONFIG_DEVEL=y' \
+                  'CONFIG_SDK=y' \
+                  'CONFIG_IB=y' \
+                  'CONFIG_IB_STANDALONE=y' >> .config; \
+              fi; \
+              make defconfig; \
+              if [ "$BUILD_ALL_KMODS" = true ]; then \
+                grep -qx 'CONFIG_ALL_KMODS=y' .config; \
+              fi; \
+              if [ "$BUILD_SDK_IMAGEBUILDER" = true ]; then \
+                grep -qx 'CONFIG_SDK=y' .config; \
+                grep -qx 'CONFIG_IB=y' .config; \
+                grep -qx 'CONFIG_IB_STANDALONE=y' .config; \
+              fi; \
+              make download -j8; \
+              find dl -type f -size -1024c -print -delete; \
+              if [ "$BUILD_ALL_KMODS" = true ]; then \
+                make target/compile -j"$(nproc)" || make target/compile -j1 V=s; \
+                make package/compile -j"$(nproc)" || make package/compile -j1 V=s; \
+                make package/index; \
+              fi; \
+              if [ "$BUILD_SDK_IMAGEBUILDER" = true ]; then \
+                make package/install -j"$(nproc)" || make package/install -j1 V=s; \
+                make target/install -j"$(nproc)" || make target/install -j1 V=s; \
+                make package/index; \
+              fi
+
+          WORKDIR /workdir/openwrt
+          CMD ["/bin/bash"]
+          BASE_DOCKERFILE
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve toolchain image
+        id: toolchain
+        shell: bash
+        env:
+          IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/autowrt
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          REBUILD_TOOLCHAIN: ${{ inputs.rebuild_toolchain }}
+        run: |
+          set -euo pipefail
+          toolchain_image="$IMAGE_REPOSITORY:toolchain-$TARGET_PLATFORM"
+          rebuild=false
+
+          if [[ "$REBUILD_TOOLCHAIN" == "true" ]]; then
+            rebuild=true
+            echo "A full toolchain rebuild was requested."
+          elif docker pull "$toolchain_image"; then
+            image_env="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$toolchain_image")"
+            cached_repo_url="$(sed -n 's/^OPENWRT_REPO_URL=//p' <<< "$image_env")"
+            cached_repo_branch="$(sed -n 's/^OPENWRT_REPO_BRANCH=//p' <<< "$image_env")"
+            cached_platform="$(sed -n 's/^OPENWRT_TARGET_PLATFORM=//p' <<< "$image_env")"
+            cached_schema="$(sed -n 's/^OPENWRT_TOOLCHAIN_SCHEMA=//p' <<< "$image_env")"
+
+            if [[ "$cached_repo_url" != "$REPO_URL" ||
+                  "$cached_repo_branch" != "$REPO_BRANCH" ||
+                  "$cached_platform" != "$TARGET_PLATFORM" ||
+                  "$cached_schema" != "2" ]]; then
+              rebuild=true
+              echo "The cached toolchain metadata does not match this build; rebuilding it."
+            else
+              echo "Reusing $toolchain_image"
+            fi
+          else
+            rebuild=true
+            echo "$toolchain_image does not exist; building it now."
+          fi
+
+          echo "image=$toolchain_image" >> "$GITHUB_OUTPUT"
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push toolchain image
+        if: steps.toolchain.outputs.rebuild == 'true'
+        shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TOOLCHAIN_IMAGE: ${{ steps.toolchain.outputs.image }}
+          TOOLCHAIN_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --file "$RUNNER_TEMP/Dockerfile.openwrt-toolchain" \
+            --build-arg TARGET_PLATFORM="$TARGET_PLATFORM" \
+            --build-arg REPO_URL="$REPO_URL" \
+            --build-arg REPO_BRANCH="$REPO_BRANCH" \
+            --build-arg TOOLCHAIN_COMMIT="$TOOLCHAIN_COMMIT" \
+            --tag "$TOOLCHAIN_IMAGE" \
+            .
+          docker push "$TOOLCHAIN_IMAGE"
+          echo "Pushed $TOOLCHAIN_IMAGE"
+
+      - name: Build and push platform image
+        shell: bash
+        env:
+          IMAGE_REPOSITORY: ${{ secrets.DOCKERHUB_USERNAME }}/autowrt
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TOOLCHAIN_IMAGE: ${{ steps.toolchain.outputs.image }}
+          BUILD_ALL_KMODS: ${{ inputs.build_all_kmods }}
+          BUILD_SDK_IMAGEBUILDER: ${{ inputs.build_sdk_imagebuilder }}
+        run: |
+          set -euo pipefail
+          image="$IMAGE_REPOSITORY:$TARGET_PLATFORM"
+          artifacts_image="autowrt-artifacts:$TARGET_PLATFORM-$GITHUB_RUN_ID"
+          cache_args=()
+
+          if docker pull "$image"; then
+            cache_args=(--cache-from "$image")
+          fi
+
+          docker build \
+            "${cache_args[@]}" \
+            --file "$RUNNER_TEMP/Dockerfile.openwrt-base" \
+            --target final \
+            --build-arg TOOLCHAIN_IMAGE="$TOOLCHAIN_IMAGE" \
+            --build-arg TARGET_PLATFORM="$TARGET_PLATFORM" \
+            --build-arg REPO_BRANCH="$REPO_BRANCH" \
+            --build-arg SOURCE_COMMIT="$SOURCE_COMMIT" \
+            --tag "$image" \
+            .
+          docker push "$image"
+          echo "Pushed $image from $TOOLCHAIN_IMAGE"
+
+          if [[ "$BUILD_ALL_KMODS" == "true" || "$BUILD_SDK_IMAGEBUILDER" == "true" ]]; then
+            export_dir="$RUNNER_TEMP/openwrt-build-tools-$TARGET_PLATFORM"
+            mkdir -p "$export_dir"
+
+            docker build \
+              --cache-from "$image" \
+              --file "$RUNNER_TEMP/Dockerfile.openwrt-base" \
+              --target artifacts \
+              --build-arg TOOLCHAIN_IMAGE="$TOOLCHAIN_IMAGE" \
+              --build-arg TARGET_PLATFORM="$TARGET_PLATFORM" \
+              --build-arg REPO_BRANCH="$REPO_BRANCH" \
+              --build-arg SOURCE_COMMIT="$SOURCE_COMMIT" \
+              --build-arg BUILD_ALL_KMODS="$BUILD_ALL_KMODS" \
+              --build-arg BUILD_SDK_IMAGEBUILDER="$BUILD_SDK_IMAGEBUILDER" \
+              --tag "$artifacts_image" \
+              .
+
+            export_container="openwrt-export-$TARGET_PLATFORM-$GITHUB_RUN_ID"
+            docker run --name "$export_container" \
+              --env BUILD_ALL_KMODS="$BUILD_ALL_KMODS" \
+              --env BUILD_SDK_IMAGEBUILDER="$BUILD_SDK_IMAGEBUILDER" \
+              "$artifacts_image" bash -lc '
+                set -euo pipefail
+                cd /workdir/openwrt
+                export_dir=/tmp/openwrt-export
+                mkdir -p "$export_dir"
+
+                if [[ "$BUILD_SDK_IMAGEBUILDER" == "true" ]]; then
+                  mapfile -d "" sdk_files < <(find bin/targets -type f -iname "*-sdk-*" -print0)
+                  mapfile -d "" imagebuilder_files < <(find bin/targets -type f -iname "*-imagebuilder-*" -print0)
+                  (( ${#sdk_files[@]} > 0 )) || { echo "No SDK archive was produced." >&2; exit 1; }
+                  (( ${#imagebuilder_files[@]} > 0 )) || { echo "No ImageBuilder archive was produced." >&2; exit 1; }
+                  cp -a "${sdk_files[@]}" "$export_dir/"
+                  cp -a "${imagebuilder_files[@]}" "$export_dir/"
+                fi
+
+                if [[ "$BUILD_ALL_KMODS" == "true" ]]; then
+                  mapfile -d "" package_dirs < <(find bin/targets -type d -name packages -print0)
+                  (( ${#package_dirs[@]} > 0 )) || { echo "No target package directory was produced." >&2; exit 1; }
+                  find "${package_dirs[@]}" -type f \( -name "kmod-*.ipk" -o -name "kmod-*.apk" \) -print -quit | grep -q . || {
+                    echo "No compiled kmod packages were produced." >&2
+                    exit 1
+                  }
+                  tar -czf "$export_dir/openwrt-kmods-${OPENWRT_TARGET_PLATFORM}.tar.gz" "${package_dirs[@]}"
+                fi
+
+                cd "$export_dir"
+                sha256sum ./* > "SHA256SUMS-${OPENWRT_TARGET_PLATFORM}"
+              '
+            docker cp "$export_container:/tmp/openwrt-export/." "$export_dir/"
+            docker rm "$export_container"
+          fi
+
+      - name: Upload optional build outputs
+        if: inputs.build_all_kmods || inputs.build_sdk_imagebuilder
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_build_tools_${{ matrix.platform }}_${{ github.run_number }}
+          path: ${{ runner.temp }}/openwrt-build-tools-${{ matrix.platform }}
+          if-no-files-found: error
+
+      - name: Show disk usage
+        if: always()
+        run: df -hT
+
+  publish:
+    name: Publish optional build outputs
+    needs: build
+    if: inputs.build_all_kmods || inputs.build_sdk_imagebuilder
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: OpenWrt_build_tools_*_${{ github.run_number }}
+          path: ${{ runner.temp }}/openwrt-release
+          merge-multiple: true
+
+      - name: Generate release metadata
+        id: release
+        shell: bash
+        env:
+          BUILD_ALL_KMODS: ${{ inputs.build_all_kmods }}
+          BUILD_SDK_IMAGEBUILDER: ${{ inputs.build_sdk_imagebuilder }}
+        run: |
+          set -euo pipefail
+          file_date="$(date +'%Y%m%d%H%M%S')"
+          echo "tag=openwrt-build-tools-${GITHUB_RUN_NUMBER}-${file_date}" >> "$GITHUB_OUTPUT"
+          echo "date=$file_date" >> "$GITHUB_OUTPUT"
+          {
+            echo "OpenWrt 可选构建产物。"
+            echo
+            echo "源码仓库: $REPO_URL"
+            echo "源码分支: $REPO_BRANCH"
+            echo "编译全部 kmod: $BUILD_ALL_KMODS"
+            echo "生成 SDK 和 ImageBuilder: $BUILD_SDK_IMAGEBUILDER"
+            echo "Workflow run: $GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/release.txt"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: OpenWrt optional build outputs ${{ steps.release.outputs.date }}
+          body_path: ${{ runner.temp }}/release.txt
+          files: ${{ runner.temp }}/openwrt-release/**/*

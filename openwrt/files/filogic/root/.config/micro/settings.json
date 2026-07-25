@@ -1,0 +1,20 @@
+{
+    "colorscheme": "cmc-16",
+    "savecursor": true,
+    "ft:c": {
+        "tabsize": 4
+    },
+    "ft:go": {
+        "tabsize": 4,
+        "tabstospaces": false
+    },
+    "ft:py": {
+        "tabsize": 4
+    },
+    "hltaberrors": true,
+    "showchars": "tab=→,itab=│→",
+    "softwrap": true,
+    "tabsize": 2,
+    "tabstospaces": true,
+    "wordwrap": true
+}

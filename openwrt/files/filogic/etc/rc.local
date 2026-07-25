@@ -1,0 +1,16 @@
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+mkdir -p /tmp/root
+cp -r /root/.config /tmp/root/
+cp -r /root/.local /tmp/root/
+#cp -r /root/.oh-my-zsh /tmp/root/
+cp /root/.zshrc /tmp/root/
+cp /root/.zsh_history /tmp/root/
+cp /root/.tmux.conf /tmp/root/
+
+#mkdir -p /tmp/sing-box/rule_set
+#mkdir -p /tmp/sing-box/config
+#cp -r /root/sing-box /tmp/
+#/etc/init.d/sing-box start
+
+exit 0
