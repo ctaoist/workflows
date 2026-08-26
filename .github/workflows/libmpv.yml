@@ -1,0 +1,622 @@
+name: Build custom libmpv
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Package version used in archive names, for example 0.7.2
+        required: true
+        default: 0.7.2
+        type: string
+      upload_artifacts:
+        description: Keep all platform builds as GitHub Actions artifacts for 30 days
+        required: true
+        default: true
+        type: boolean
+      publish_release:
+        description: Create or update a GitHub Release with all platform builds
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Release tag; leave empty to use libmpv-v<package_version>
+        required: false
+        type: string
+      release_name:
+        description: Release title; leave empty to use Custom libmpv v<package_version>
+        required: false
+        type: string
+      replace_existing_assets:
+        description: Replace assets when the selected Release already exists
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-libmpv-${{ inputs.release_tag || inputs.package_version }}
+  cancel-in-progress: false
+
+env:
+  # Pin all source/build definitions. Updating any value is an explicit,
+  # reviewable dependency upgrade.
+  WINDOWS_BUILDER_COMMIT: 222494909872cafd8359ec7a1bfd1e062f4482c9
+  DARWIN_BUILDER_COMMIT: b4e3ce98826cd4a28f6121b29f56ea203346e6e3
+  LINUX_MPV_COMMIT: e48ac7ce08462f5e33af6ef9deeac6fa87eef01e
+  WINDOWS_BUILDER_URL: https://github.com/media-kit/libmpv-win32-audio-build.git
+  DARWIN_BUILDER_URL: https://github.com/media-kit/libmpv-darwin-build.git
+  LINUX_MPV_URL: https://github.com/mpv-player/mpv.git
+
+jobs:
+  metadata:
+    name: Validate build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.metadata.outputs.package_version }}
+      archive_version: ${{ steps.metadata.outputs.archive_version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      release_name: ${{ steps.metadata.outputs.release_name }}
+    steps:
+      - name: Validate inputs
+        id: metadata
+        shell: bash
+        env:
+          PACKAGE_VERSION_INPUT: ${{ inputs.package_version }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          RELEASE_NAME_INPUT: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+
+          package_version="${PACKAGE_VERSION_INPUT#v}"
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || \
+             [[ "$package_version" == *..* ]]; then
+            echo "package_version must be a semantic version such as 0.7.2 or 0.7.2-custom.1." >&2
+            exit 1
+          fi
+
+          release_tag="${RELEASE_TAG_INPUT//[[:space:]]/}"
+          if [[ -z "$release_tag" ]]; then
+            release_tag="libmpv-v$package_version"
+          fi
+          if ! git check-ref-format --allow-onelevel "refs/tags/$release_tag"; then
+            echo "Invalid Git release tag: $release_tag" >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_NAME_INPUT" == *$'\n'* || "$RELEASE_NAME_INPUT" == *$'\r'* ]]; then
+            echo "release_name must be a single line." >&2
+            exit 1
+          fi
+          release_name="$RELEASE_NAME_INPUT"
+          if [[ -z "$release_name" ]]; then
+            release_name="Custom libmpv v$package_version"
+          fi
+
+          {
+            echo "package_version=$package_version"
+            echo "archive_version=v$package_version"
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build Windows x64 audio libmpv
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ghcr.io/shinchiro/archlinux:latest
+    env:
+      BUILD_ROOT: windows-builder
+      TARGET_NAME: x86_64
+    steps:
+      - name: Configure Git for the container workspace
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global fetch.prune true
+
+      - name: Check out pinned Windows build definitions
+        run: |
+          set -euo pipefail
+          rm -rf "$BUILD_ROOT"
+          git init "$BUILD_ROOT"
+          git -C "$BUILD_ROOT" remote add origin "$WINDOWS_BUILDER_URL"
+          git -C "$BUILD_ROOT" fetch --depth 1 origin "$WINDOWS_BUILDER_COMMIT"
+          git -C "$BUILD_ROOT" checkout --detach FETCH_HEAD
+          test "$(git -C "$BUILD_ROOT" rev-parse HEAD)" = "$WINDOWS_BUILDER_COMMIT"
+
+      - name: Restore cross-toolchain and source cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            windows-builder/build_x86_64
+            windows-builder/src_packages
+            windows-builder/clang_root
+          key: custom-libmpv-windows-${{ env.WINDOWS_BUILDER_COMMIT }}-${{ github.run_id }}
+          restore-keys: |
+            custom-libmpv-windows-${{ env.WINDOWS_BUILDER_COMMIT }}-
+
+      - name: Configure the Windows cross build
+        working-directory: windows-builder
+        run: |
+          set -euo pipefail
+          cmake \
+            -DTARGET_ARCH=x86_64-w64-mingw32 \
+            -DSINGLE_SOURCE_LOCATION="$PWD/src_packages" \
+            -DRUSTUP_LOCATION="$PWD/clang_root/install_rustup" \
+            -DENABLE_CCACHE=ON \
+            --fresh \
+            -G Ninja \
+            -B build_x86_64 \
+            -S "$PWD"
+          ninja -C build_x86_64 download
+
+      - name: Build the MinGW toolchain
+        working-directory: windows-builder
+        run: |
+          set -euo pipefail
+          if [[ ! -x build_x86_64/install/bin/cross-gcc ]]; then
+            ninja -C build_x86_64 gcc
+            rm -rf build_x86_64/toolchain
+          fi
+
+      - name: Build the customized libmpv DLL
+        working-directory: windows-builder
+        run: |
+          set -euo pipefail
+          ninja -C build_x86_64 update
+          ninja -C build_x86_64 mpv
+          rm -rf build_x86_64/mpv-debug*
+          ninja -C build_x86_64 mpv-packaging
+
+      - name: Package and verify the Windows build
+        env:
+          ARCHIVE_VERSION: ${{ needs.metadata.outputs.archive_version }}
+        run: |
+          set -euo pipefail
+          mapfile -t source_archives < <(find "$BUILD_ROOT/build_x86_64" -maxdepth 1 \
+            -type f -name 'mpv-dev-x86_64-*.7z' -print)
+          if (( ${#source_archives[@]} != 1 )); then
+            printf 'Expected one Windows development archive, found %d.\n' \
+              "${#source_archives[@]}" >&2
+            printf '%s\n' "${source_archives[@]}" >&2
+            exit 1
+          fi
+
+          output_dir="$GITHUB_WORKSPACE/output-windows"
+          verify_dir="$RUNNER_TEMP/verify-windows"
+          archive_name="libmpv-windows-x64-audio_${ARCHIVE_VERSION}.7z"
+          rm -rf "$output_dir" "$verify_dir"
+          mkdir -p "$output_dir" "$verify_dir"
+          cp "${source_archives[0]}" "$output_dir/$archive_name"
+          7z x -y "$output_dir/$archive_name" "-o$verify_dir" >/dev/null
+
+          dll="$(find "$verify_dir" -type f -name 'libmpv-2.dll' -print -quit)"
+          header="$(find "$verify_dir" -type f -path '*/include/mpv/client.h' -print -quit)"
+          test -n "$dll" && test -n "$header"
+          file "$dll" | tee "$RUNNER_TEMP/windows-file.txt"
+          grep -Eq 'PE32\+.*x86-64' "$RUNNER_TEMP/windows-file.txt"
+
+          mpv_commit="$(git -C "$BUILD_ROOT/src_packages/mpv" rev-parse HEAD)"
+          ffmpeg_commit="$(git -C "$BUILD_ROOT/src_packages/ffmpeg" rev-parse HEAD)"
+          {
+            echo "Platform: Windows x64"
+            echo "Variant: audio"
+            echo "Builder: $WINDOWS_BUILDER_URL@$WINDOWS_BUILDER_COMMIT"
+            echo "mpv commit: $mpv_commit"
+            echo "FFmpeg commit: $ffmpeg_commit"
+            echo "Workflow commit: $GITHUB_SHA"
+          } > "$output_dir/libmpv-windows-x64-audio_${ARCHIVE_VERSION}.txt"
+
+      - name: Upload Windows artifacts
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-windows-x64-audio_${{ needs.metadata.outputs.archive_version }}
+          path: output-windows/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stage Windows output for the Release
+        if: ${{ inputs.publish_release && !inputs.upload_artifacts }}
+        uses: actions/cache/save@v4
+        with:
+          path: output-windows
+          key: custom-libmpv-release-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+
+      - name: Clean transient Windows build output
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$BUILD_ROOT/build_x86_64/mpv"*
+          if [[ -f "$BUILD_ROOT/build_x86_64/build.ninja" ]]; then
+            ninja -C "$BUILD_ROOT/build_x86_64" cargo-clean || true
+          fi
+
+  linux:
+    name: Build Linux x86_64 audio libmpv
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential ca-certificates git meson ninja-build pkg-config \
+            libasound2-dev libass-dev libavcodec-dev libavfilter-dev \
+            libavformat-dev libavutil-dev libpipewire-0.3-dev libplacebo-dev \
+            libpulse-dev libswresample-dev libswscale-dev
+
+      - name: Check out pinned mpv source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/linux-mpv"
+          rm -rf "$source_dir"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin "$LINUX_MPV_URL"
+          git -C "$source_dir" fetch --depth 1 origin "$LINUX_MPV_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$LINUX_MPV_COMMIT"
+
+      - name: Configure and build the Linux shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/linux-mpv"
+          install_dir="$RUNNER_TEMP/libmpv-linux-install"
+          rm -rf "$install_dir"
+
+          meson setup "$source_dir/build" "$source_dir" \
+            --prefix="$install_dir" \
+            --libdir=lib \
+            --buildtype=release \
+            --default-library=shared \
+            -Dauto_features=disabled \
+            -Db_lto=true \
+            -Dbuild-date=false \
+            -Dcplayer=false \
+            -Dfuzzers=false \
+            -Dgpl=false \
+            -Dlibmpv=true \
+            -Dtests=false \
+            -Dalsa=enabled \
+            -Dpipewire=enabled \
+            -Dpulse=enabled
+          meson compile -C "$source_dir/build"
+          meson install -C "$source_dir/build" --strip
+
+      - name: Package and verify the Linux build
+        shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ needs.metadata.outputs.archive_version }}
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/linux-mpv"
+          install_dir="$RUNNER_TEMP/libmpv-linux-install"
+          output_dir="$GITHUB_WORKSPACE/output-linux"
+          package_name="libmpv-linux-x86_64-audio_${ARCHIVE_VERSION}"
+          package_parent="$RUNNER_TEMP/package-linux"
+          package_dir="$package_parent/$package_name"
+          archive="$output_dir/$package_name.tar.gz"
+          rm -rf "$output_dir" "$package_parent"
+          mkdir -p "$output_dir" "$package_dir"
+          cp -a "$install_dir"/. "$package_dir"/
+
+          library="$(find "$package_dir/lib" -type f -name 'libmpv.so.*' -print -quit)"
+          header="$package_dir/include/mpv/client.h"
+          pkg_config="$package_dir/lib/pkgconfig/mpv.pc"
+          test -n "$library" && test -f "$header" && test -f "$pkg_config"
+          test -L "$package_dir/lib/libmpv.so"
+
+          readelf -h "$library" | tee "$RUNNER_TEMP/linux-elf.txt"
+          grep -q 'Class:.*ELF64' "$RUNNER_TEMP/linux-elf.txt"
+          grep -q 'Machine:.*Advanced Micro Devices X86-64' "$RUNNER_TEMP/linux-elf.txt"
+          readelf -d "$library" > "$RUNNER_TEMP/linux-dynamic.txt"
+          grep -q 'SONAME.*libmpv.so.2' "$RUNNER_TEMP/linux-dynamic.txt"
+          nm -D "$library" > "$RUNNER_TEMP/linux-symbols.txt"
+          grep -q ' mpv_create$' "$RUNNER_TEMP/linux-symbols.txt"
+          ldd "$library" > "$package_dir/RUNTIME-DEPENDENCIES.txt"
+          if grep -q 'not found' "$package_dir/RUNTIME-DEPENDENCIES.txt"; then
+            echo "The Linux libmpv build has unresolved runtime dependencies." >&2
+            exit 1
+          fi
+
+          cp "$source_dir/LICENSE.LGPL" "$package_dir/LICENSE.LGPL"
+          cp "$source_dir/build/meson-logs/meson-log.txt" "$package_dir/MESON-CONFIGURE.log"
+          {
+            echo "Platform: Linux x86_64 (Ubuntu 24.04 baseline)"
+            echo "Variant: audio (ALSA, PulseAudio, PipeWire)"
+            echo "mpv source: $LINUX_MPV_URL@$LINUX_MPV_COMMIT"
+            echo "Workflow commit: $GITHUB_SHA"
+          } | tee "$package_dir/BUILD-INFO.txt" \
+            > "$output_dir/$package_name.txt"
+
+          tar --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$package_parent" \
+            -czf "$archive" \
+            "$package_name"
+          tar -tzf "$archive" >/dev/null
+
+      - name: Upload Linux artifacts
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-linux-x86_64-audio_${{ needs.metadata.outputs.archive_version }}
+          path: output-linux/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stage Linux output for the Release
+        if: ${{ inputs.publish_release && !inputs.upload_artifacts }}
+        uses: actions/cache/save@v4
+        with:
+          path: output-linux
+          key: custom-libmpv-release-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+
+  macos:
+    name: Build macOS universal audio libmpv
+    needs: metadata
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Show platform information
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcodebuild -version
+
+      - name: Check out pinned Darwin build definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/darwin-builder"
+          rm -rf "$source_dir"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin "$DARWIN_BUILDER_URL"
+          git -C "$source_dir" fetch --depth 1 origin "$DARWIN_BUILDER_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$DARWIN_BUILDER_COMMIT"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            sandbox = true
+            sandbox-fallback = false
+
+      - name: Enable the Nix build cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        with:
+          use-flakehub: false
+
+      - name: Resolve Xcode path
+        id: xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          preferred=/Applications/Xcode_16.1.0.app
+          if [[ -d "$preferred" ]]; then
+            xcode_path="$(realpath "$preferred")"
+          else
+            developer_dir="$(xcode-select -p)"
+            xcode_path="$(dirname "$(dirname "$developer_dir")")"
+          fi
+          test -x "$xcode_path/Contents/Developer/usr/bin/xcodebuild"
+          "$xcode_path/Contents/Developer/usr/bin/xcodebuild" -version
+          echo "path=$xcode_path" >> "$GITHUB_OUTPUT"
+
+      - name: Build the customized universal XCFrameworks
+        shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ needs.metadata.outputs.archive_version }}
+          XCODE_PATH: ${{ steps.xcode.outputs.path }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/darwin-builder"
+          nix develop -c make \
+            XCODE_PATH="$XCODE_PATH" \
+            VERSION="$ARCHIVE_VERSION" \
+            TARGET=mk-out-archive-xcframeworks-macos-universal-audio-default
+
+      - name: Verify the macOS build
+        shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ needs.metadata.outputs.archive_version }}
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/darwin-builder"
+          archive="$source_dir/result/libmpv-xcframeworks_${ARCHIVE_VERSION}_macos-universal-audio-default.tar.gz"
+          verify_dir="$RUNNER_TEMP/verify-macos"
+          test -f "$archive"
+          rm -rf "$verify_dir"
+          mkdir -p "$verify_dir"
+          tar -xzf "$archive" -C "$verify_dir"
+
+          mpv_binary="$(find "$verify_dir" -type f -path '*/Mpv.framework/Mpv' -print -quit)"
+          test -n "$mpv_binary"
+          architectures="$(lipo -archs "$mpv_binary")"
+          echo "Mpv.framework architectures: $architectures"
+          [[ " $architectures " == *' arm64 '* ]]
+          [[ " $architectures " == *' x86_64 '* ]]
+
+          for framework in Mpv Avcodec Avformat Avutil Swresample; do
+            if ! find "$verify_dir" -type d -name "$framework.framework" -print -quit | grep -q .; then
+              echo "Required framework is missing: $framework.framework" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "Platform: macOS universal (arm64, x86_64)"
+            echo "Variant: audio-default"
+            echo "Builder: $DARWIN_BUILDER_URL@$DARWIN_BUILDER_COMMIT"
+            echo "Workflow commit: $GITHUB_SHA"
+          } > "$source_dir/result/libmpv-macos-universal-audio_${ARCHIVE_VERSION}.txt"
+
+      - name: Upload macOS artifacts
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-macos-universal-audio_${{ needs.metadata.outputs.archive_version }}
+          path: |
+            darwin-builder/result/*.tar.gz
+            darwin-builder/result/*.zip
+            darwin-builder/result/*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stage macOS output for the Release
+        if: ${{ inputs.publish_release && !inputs.upload_artifacts }}
+        uses: actions/cache/save@v4
+        with:
+          path: darwin-builder/result
+          key: custom-libmpv-release-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+
+  release:
+    name: Publish libmpv Release
+    if: inputs.publish_release
+    needs: [metadata, windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform artifacts
+        if: inputs.upload_artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Restore Windows output for the Release
+        if: ${{ !inputs.upload_artifacts }}
+        uses: actions/cache/restore@v4
+        with:
+          path: output-windows
+          key: custom-libmpv-release-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Restore macOS output for the Release
+        if: ${{ !inputs.upload_artifacts }}
+        uses: actions/cache/restore@v4
+        with:
+          path: darwin-builder/result
+          key: custom-libmpv-release-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Restore Linux output for the Release
+        if: ${{ !inputs.upload_artifacts }}
+        uses: actions/cache/restore@v4
+        with:
+          path: output-linux
+          key: custom-libmpv-release-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Collect cached platform output
+        if: ${{ !inputs.upload_artifacts }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp output-windows/* dist/
+          cp output-linux/* dist/
+          cp darwin-builder/result/*.tar.gz dist/
+          cp darwin-builder/result/*.zip dist/
+          cp darwin-builder/result/*.txt dist/
+
+      - name: Generate checksums and release notes
+        shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ needs.metadata.outputs.archive_version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          mapfile -t files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort)
+          (( ${#files[@]} > 0 ))
+          sha256sum "${files[@]}" > SHA256SUMS
+          {
+            echo "Customized audio-focused libmpv $ARCHIVE_VERSION."
+            echo
+            echo "- Windows: x64 DLL and C headers"
+            echo "- Linux: x86_64 shared library and C headers"
+            echo "- macOS: universal arm64/x86_64 XCFramework bundle"
+            echo "- Windows builder: $WINDOWS_BUILDER_URL@$WINDOWS_BUILDER_COMMIT"
+            echo "- Linux mpv source: $LINUX_MPV_URL@$LINUX_MPV_COMMIT"
+            echo "- Darwin builder: $DARWIN_BUILDER_URL@$DARWIN_BUILDER_COMMIT"
+            echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create or update the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          REPLACE_EXISTING_ASSETS: ${{ inputs.replace_existing_assets }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$REPLACE_EXISTING_ASSETS" != true ]]; then
+              echo "Release $RELEASE_TAG already exists; enable replace_existing_assets to overwrite it." >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+          mapfile -t assets < <(find dist -maxdepth 1 -type f -print | sort)
+          (( ${#assets[@]} > 0 ))
+          gh release upload "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  cleanup-release-cache:
+    name: Delete temporary Release transfer caches
+    if: ${{ always() && inputs.publish_release && !inputs.upload_artifacts }}
+    needs: [windows, linux, macos, release]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete run-scoped caches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh cache delete \
+            "custom-libmpv-release-windows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --confirm || true
+          gh cache delete \
+            "custom-libmpv-release-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --confirm || true
+          gh cache delete \
+            "custom-libmpv-release-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --confirm || true
