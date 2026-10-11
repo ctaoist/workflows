@@ -168,14 +168,13 @@ jobs:
                   printf "%s\n" "CONFIG_MITIGATION_TSA=y" >> "$kernel_config"
               fi
 
-              chmod +x /tmp/workflow-openwrt/diy-part1.sh /tmp/workflow-openwrt/diy-part2.sh
-              /tmp/workflow-openwrt/diy-part1.sh
+              bash /tmp/workflow-openwrt/diy-part1.sh
               ./scripts/feeds update -a
               ./scripts/feeds install -a
 
               cp /tmp/workflow-openwrt/vermagic .vermagic
               cp /tmp/workflow-openwrt/vermagic_patch ./vermagic_patch
-              /tmp/workflow-openwrt/diy-part2.sh
+              bash /tmp/workflow-openwrt/diy-part2.sh
 
               rm -rf ./files
               if [[ "$APPLY_FILES" == "true" ]]; then
