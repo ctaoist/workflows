@@ -1,12 +1,30 @@
 # Put your custom commands here that should be executed once
 # the system init finished. By default this file does nothing.
 mkdir -p /tmp/root
+# mkdir -p /tmp/root/.config
 cp -r /root/.config /tmp/root/
 cp -r /root/.local /tmp/root/
-#cp -r /root/.oh-my-zsh /tmp/root/
+cp -r /root/.oh-my-zsh /tmp/root/
+cp -r /root/.ssh /tmp/root/
 cp /root/.zshrc /tmp/root/
 cp /root/.zsh_history /tmp/root/
 cp /root/.tmux.conf /tmp/root/
+
+# /etc/init.d/fm350-gl start
+# fm350-gl cleanup-network
+# fm350-gl restart &
+# sleep 30
+
+/etc/init.d/tmux-web start
+
+#cp -r /root/zerotier-one /var/lib/
+#/etc/init.d/zerotier start
+
+# cp -r /root/mihomo /tmp/
+# /etc/init.d/mihomo start
+#ln -sf /tmp/mihomo /etc/nikki
+#mv mihomo run
+#/etc/init.d/nikki start
 
 #mkdir -p /tmp/sing-box/rule_set
 #mkdir -p /tmp/sing-box/config
